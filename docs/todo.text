@@ -1,0 +1,438 @@
+import sys
+import time
+import threading
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+from ibapi.order import Order
+from ibapi.common import OrderId
+
+def clean_order(order: Order) -> Order:
+    """
+    Force these attributes to exist (and be False).
+    If we don't define them, IB Python API will try make_field(order.allOrNone)
+    and crash if 'allOrNone' doesn't exist.
+    """
+    order.allOrNone = False
+    order.eTradeOnly = False
+    order.firmQuoteOnly = False
+    return order
+
+class DynamicBracketApp(EWrapper, EClient):
+    def __init__(self):
+        EWrapper.__init__(self)
+        EClient.__init__(self, wrapper=self)
+
+        self.next_order_id = None
+
+        # Track parent info
+        self.parent_order_id = None
+        self.parent_fill_price = None
+        self.parent_order_filled = False
+
+        # Make sure we only place child orders once
+        self.child_orders_placed = False
+
+    def connect_and_start(self):
+        print("Connecting to IB Gateway/TWS...")
+        # Adjust port if you're on LIVE TWS (usually 7496).
+        self.connect("127.0.0.1", 7497, clientId=9)
+
+        # Start the reader thread
+        api_thread = threading.Thread(target=self.run)
+        api_thread.start()
+
+        time.sleep(2)
+
+        if not self.isConnected():
+            print("Still not connected. Check TWS is open, port=7497, API enabled, no firewall blocks.")
+            sys.exit(1)
+
+        # Request the next valid ID
+        self.reqIds(-1)
+
+        # Wait until we have an order ID
+        while self.next_order_id is None:
+            print("Waiting for next valid order ID...")
+            time.sleep(1)
+
+        # Place the parent MARKET order
+        self.place_parent_market_order()
+
+    def create_mes_contract(self):
+        contract = Contract()
+        contract.symbol = "MES"
+        contract.secType = "FUT"
+        contract.exchange = "CME"
+        contract.currency = "USD"
+        # Example: March 2025
+        contract.lastTradeDateOrContractMonth = "20250321"
+        return contract
+
+    def place_parent_market_order(self):
+        self.parent_order_id = self.next_order_id
+        self.next_order_id += 1
+
+        contract = self.create_mes_contract()
+
+        parent_order = Order()
+        parent_order.orderId = self.parent_order_id
+        parent_order.action = "BUY"
+        parent_order.orderType = "MKT"
+        parent_order.totalQuantity = 1
+        parent_order.transmit = True  # send immediately
+
+        clean_order(parent_order)
+
+        print(f"Placing parent MARKET order (ID={self.parent_order_id})...")
+        self.placeOrder(self.parent_order_id, contract, parent_order)
+
+    def place_child_orders(self):
+        """
+        Instead of referencing the now-filled parent order,
+        we place an OCA group with two orders: a limit (take-profit)
+        and a stop (stop-loss). That way, TWS won't complain
+        that we're modifying a filled parent. Also, we'll set
+        transmit=True so they go live immediately.
+        """
+        contract = self.create_mes_contract()
+        fill_price = self.parent_fill_price
+        qty = 1
+
+        # Example bracket logic for LONG
+        take_profit_price = fill_price + 2.0
+        stop_loss_price   = fill_price - 1.0
+
+        # We'll create an OCA group so if one order fills, TWS cancels the other
+        oca_group_name = "DYN_BRACKET_OCA"
+
+        tp_id = self.next_order_id
+        self.next_order_id += 1
+        sl_id = self.next_order_id
+        self.next_order_id += 1
+
+        # TAKE-PROFIT (Limit)
+        tp_order = Order()
+        tp_order.orderId = tp_id
+        tp_order.action = "SELL"
+        tp_order.orderType = "LMT"
+        tp_order.totalQuantity = qty
+        tp_order.lmtPrice = take_profit_price
+        tp_order.ocaGroup = oca_group_name
+        tp_order.ocaType = 1  # 1 = CANCEL_WITH_BLOCK (typical OCA)
+        tp_order.transmit = False  # We'll transmit with the stop
+
+        clean_order(tp_order)
+
+        # STOP-LOSS (Stop)
+        sl_order = Order()
+        sl_order.orderId = sl_id
+        sl_order.action = "SELL"
+        sl_order.orderType = "STP"
+        sl_order.auxPrice = stop_loss_price
+        sl_order.totalQuantity = qty
+        sl_order.ocaGroup = oca_group_name
+        sl_order.ocaType = 1
+        sl_order.transmit = True  # This final child transmits the bracket
+
+        clean_order(sl_order)
+
+        print(f"\nPlacing OCA child orders (no parentId, but OCA linked):\n"
+              f"  TAKE-PROFIT (ID={tp_id}) @ {take_profit_price}\n"
+              f"  STOP-LOSS   (ID={sl_id}) @ {stop_loss_price}\n")
+
+        self.placeOrder(tp_id, contract, tp_order)
+        self.placeOrder(sl_id, contract, sl_order)
+
+    # -------------------------
+    # EWrapper EVENT HANDLERS
+    # -------------------------
+
+    def nextValidId(self, orderId: OrderId):
+        super().nextValidId(orderId)
+        self.next_order_id = orderId
+        print(f"Received nextValidId: {orderId}")
+
+    def orderStatus(self, orderId, status, filled, remaining,
+                    avgFillPrice, permId, parentId, lastFillPrice,
+                    clientId, whyHeld, mktCapPrice):
+        print(f"orderStatus: ID={orderId}, Status={status}, "
+              f"Filled={filled}, AvgPrice={avgFillPrice}")
+
+        # If the parent order is FILLED (and we haven't placed children yet):
+        if (orderId == self.parent_order_id 
+            and status.upper() == "FILLED" 
+            and not self.child_orders_placed):
+
+            self.child_orders_placed = True
+            self.parent_fill_price = avgFillPrice
+            self.parent_order_filled = True
+
+            print(f"Parent order {orderId} FILLED at {avgFillPrice}. Placing child orders now...")
+            self.place_child_orders()
+
+            # Give TWS a moment to process the child orders
+            time.sleep(2)
+            print("All orders placed. Exiting script now.")
+            self.disconnect()
+            sys.exit(0)
+
+    def execDetails(self, reqId, contract, execution):
+        super().execDetails(reqId, contract, execution)
+        print(f"execDetails: {execution}")
+
+    def error(self, reqId, errorCode, errorString, advancedOrderRejectJson=None):
+        print(f"Error: reqId={reqId}, code={errorCode}, msg={errorString}")
+        if advancedOrderRejectJson:
+            print(f"AdvancedOrderRejectJson: {advancedOrderRejectJson}")
+
+def main():
+    app = DynamicBracketApp()
+    app.connect_and_start()
+    # We do NOT keep looping forever; 
+    # we rely on the final sys.exit(0) after child orders are placed.
+
+if __name__ == "__main__":
+    main()
+
+
+Below is an overview of how institutional traders (and, in fact, any Interactive Brokers client) typically set up bracket orders and OCA (one-cancels-all) logic using the Interactive Brokers API (IBAPI). The same fundamental approach applies whether you are retail or institutional; larger trading desks may simply automate and scale up more extensively, but the bracket order mechanics remain the same.
+
+1. Understanding Bracket & OCA Orders
+Bracket Order
+A bracket order is essentially a three-part order structure:
+
+Parent Order: The main entry order (to open a position).
+Take Profit (Child) Order: A limit order to close the position at a target profit level.
+Stop Loss (Child) Order: A stop (or stop-limit) order to close the position at a specific loss threshold.
+The two child orders are typically linked to the parent (so that once the parent fills, the children become active), and they share One-Cancels-All (OCA) logic so that if either the take profit or stop loss is filled, the other one is automatically canceled.
+
+OCA (One-Cancels-All)
+OCA grouping ensures that if any order in the group executes, all remaining orders in that group are canceled. With a bracket order, the take-profit and stop-loss orders are in the same OCA group.
+
+2. Setting Up the IBAPI Environment
+To place orders programmatically using IB, you’ll use:
+
+TWS (Trader Workstation) or IB Gateway as the local API gateway.
+ibapi Python package (provided by IB).
+Basic Steps
+Install the IB Python API
+bash
+Copy
+pip install ibapi
+Enable “ActiveX and Socket Clients” in TWS/IB Gateway settings.
+Connect to TWS/IB Gateway in your Python script using the EClient/EWrapper classes.
+3. Creating a Bracket Order in Python
+Below is a common helper function that returns a parent + two children orders, all linked in the same OCA group. You can adapt it to your specific needs.
+
+Note: This sample is for illustration. In live trading, make sure to handle errors, reconnections, and order confirmations carefully.
+
+python
+Copy
+from ibapi.order import Order
+
+def make_bracket_order(
+    parent_order_id: int,
+    action: str, 
+    quantity: int,
+    entry_price: float,
+    take_profit_price: float, 
+    stop_loss_price: float
+):
+    """
+    Creates a bracket order (parent + 2 children) with OCA logic.
+    :param parent_order_id: int - Unique ID for the parent order.
+    :param action: 'BUY' or 'SELL' - Action for the parent order.
+    :param quantity: int - Quantity to trade.
+    :param entry_price: float - Price for parent limit order (if using LMT).
+    :param take_profit_price: float - Price for limit exit.
+    :param stop_loss_price: float - Price for stop exit.
+    :return: (parent, take_profit, stop_loss)
+    """
+
+    # 1) Parent Order
+    parent = Order()
+    parent.orderId = parent_order_id
+    parent.action = action
+    parent.orderType = "LMT"        # or "MKT" if you want a market order
+    parent.totalQuantity = quantity
+    parent.lmtPrice = entry_price
+    parent.transmit = False         # Important: transmit = False, 
+                                    # so we can build child orders before sending
+
+    # 2) Take Profit Child
+    take_profit = Order()
+    take_profit.orderId = parent_order_id + 1
+    take_profit.action = "SELL" if action == "BUY" else "BUY"
+    take_profit.orderType = "LMT"
+    take_profit.totalQuantity = quantity
+    take_profit.lmtPrice = take_profit_price
+    take_profit.parentId = parent_order_id
+    take_profit.transmit = False
+
+    # 3) Stop Loss Child
+    stop_loss = Order()
+    stop_loss.orderId = parent_order_id + 2
+    stop_loss.action = "SELL" if action == "BUY" else "BUY"
+    stop_loss.orderType = "STP"     # or "STP LMT", etc.
+    stop_loss.totalQuantity = quantity
+    stop_loss.auxPrice = stop_loss_price
+    stop_loss.parentId = parent_order_id
+    stop_loss.transmit = True       # This will trigger the whole bracket to transmit
+
+    # 4) OCA Group Setup
+    # Assign OCA group so that if one order fills, the other is cancelled.
+    oca_group_name = f"OCA_{parent_order_id}"
+    take_profit.ocaGroup = oca_group_name
+    stop_loss.ocaGroup = oca_group_name
+
+    # OCA Type = 1 means any order filling completely will cancel remaining
+    take_profit.ocaType = 1
+    stop_loss.ocaType = 1
+
+    return parent, take_profit, stop_loss
+Sending the Orders
+Assuming you have a working App class that inherits from EWrapper and EClient, you’d do something like:
+
+python
+Copy
+def place_bracket_order(app, contract, parent_id, action, quantity, entry_price, take_profit_price, stop_loss_price):
+    # 1) Build the bracket
+    parent, take_profit, stop_loss = make_bracket_order(
+        parent_order_id=parent_id,
+        action=action,
+        quantity=quantity,
+        entry_price=entry_price,
+        take_profit_price=take_profit_price,
+        stop_loss_price=stop_loss_price
+    )
+
+    # 2) Place orders
+    # The 'app.placeOrder()' signature is: placeOrder(orderId, contract, order)
+    app.placeOrder(parent.orderId, contract, parent)
+    app.placeOrder(take_profit.orderId, contract, take_profit)
+    app.placeOrder(stop_loss.orderId, contract, stop_loss)
+contract: Must be a properly defined IB Contract object (e.g., stock, future, option).
+parent_id: You must supply a unique ID for the parent. IB expects unique IDs (within a session) for each order.
+4. Key Considerations for Institutional Traders
+Volume & Liquidity
+
+Institutions often split large orders into slices (e.g., VWAP or TWAP execution algorithms) rather than a single bracket.
+You can still apply bracket logic on each slice or use IB’s advanced algos for partial fills.
+Routing
+
+Institutions may use directed orders or IB’s SmartRouting. The bracket logic remains the same but the order routing can become more sophisticated.
+Risk Management & Monitoring
+
+Institutional desks usually have separate risk-management systems that monitor positions and can override or cancel bracket orders if needed.
+You can use IBAPI callbacks (e.g., orderStatus, execDetails) to track partial fills, remainders, etc.
+Transmit Flags
+
+The reason we set parent.transmit = False is so that all bracket parts are sent to IB at once and become active together. The last child (stop_loss in the example) has transmit = True which transmits the entire bracket block.
+OCA Grouping
+
+As shown, both child orders share ocaGroup = "OCA_<some_id>". This ensures that once one child order is fully executed, the other child is canceled.
+ocaType = 1 means any full fill cancels the other. There are other OCA types for partial fills, etc., if needed.
+5. Additional Tips & References
+Testing in Paper Account
+Always test new bracket logic in a paper (demo) account to ensure the bracket and OCA behavior works as intended.
+Order Handling in EWrapper
+Implement the relevant callbacks (e.g., openOrder, orderStatus, execDetails) to confirm the orders have been accepted, partially filled, etc.
+IB Sample Code
+Interactive Brokers provides sample bracket order code in C++, C#, Python, Java, etc. on their API GitHub and official documentation.
+Summary
+To generate a bracket (OCA) order via IBAPI:
+
+Build the Parent (entry) order.
+Build the Child orders (take-profit and stop-loss).
+Assign both child orders to the same OCA group with ocaGroup and ocaType.
+Transmit them in the right order, ensuring transmit = False for all but the final child.
+Although large institutional traders may have more complex logic for splitting orders, algorithmic routing, and risk oversight, the fundamental structure for bracket/OCA remains the same in the IBAPI.
+
+Below is some context on threading, dynamic order placement, and how this compares to what institutional traders do. The code you showed is a perfectly workable example of a “dynamic bracket” strategy in Python using the IB API, but let’s clarify a few points:
+
+1. Do You Need Multiple Threads?
+Typical IBAPI Thread Model
+One Thread for app.run()
+In IB’s Python framework, we typically run EClient.run() (the API event loop) in one separate thread. This is because run() is a blocking call that processes incoming messages from TWS/IB Gateway.
+
+Main Thread for Orchestration
+The main thread (or your script’s entry point) usually does things like:
+
+Connect to IB (app.connect(...))
+Start the run loop in a separate thread (threading.Thread(target=app.run))
+Place orders
+Possibly watch flags and terminate gracefully
+Additional Threads (Optional)
+
+If your strategy is complex, you might have additional worker threads (or async tasks) for data handling, advanced logic, real-time analytics, or bridging to other services.
+But for a simple bracket order or click-to-trade flow, you typically do NOT need 3 separate threads. One for IBAPI + your main thread is enough.
+Conclusion: The sample code you posted has exactly this pattern: a single “API thread” for run(), and the main script runs outside that thread. You don’t need one thread per order.
+
+2. Dynamic vs. Static Bracket Orders
+Static (All-In-One) Bracket
+A “static” bracket sends all parts (parent + child OCA orders) at once, with transmit=False on the parent and first child(ren), and transmit=True on the last child.
+The advantage: everything is live and in place before any fills occur.
+The disadvantage: if the parent is a market order, you might not know your exact fill price in advance, which can lead to uncertain stop or limit levels.
+Dynamic (Wait for Fill, Then Place Children)
+Your sample code places a market parent order, waits to see where it actually fills (via orderStatus), then calculates and places the child orders.
+The advantage: your stops and profit targets can be precisely anchored to the actual fill price.
+The disadvantage: there is a brief window after the parent fill but before the children are active (i.e., market risk for a few milliseconds/seconds if something unexpected happens).
+Institutions do both approaches depending on their needs. For small, quick trades, it’s often acceptable to do an all-in-one bracket with a limit parent (so you know the price). For a true market parent, it’s common to do a dynamic approach. If you must handle extremely large or partial fills, you might break the order up or have more complex logic.
+
+3. Typical Institutional Logic
+Order Slicing / Algorithms
+Large institutional desks often:
+
+Use slicing algorithms (TWAP, VWAP, POV, etc.) or
+Place partial bracket orders as they get partial fills.
+Risk & Trade Book Systems
+They typically have external risk/trade-book systems that:
+
+Watch for partial fills in real-time,
+Possibly adjust the child orders (stop, limit) based on the average fill price so far,
+May do child orders in proportion to how many shares/contracts have filled.
+Concurrency
+
+Institutional systems often have multiple concurrent strategies, but not necessarily “multiple threads per bracket.” Instead, they have an event-driven architecture (could be multiple microservices or message bus).
+The IB API “one thread for event loop” design can still be used, but they might have separate microservices or multiple gateways for different asset classes/regions.
+Your code snippet is definitely something a smaller professional trader or an individual could use, or it might be a minimal piece within a larger institutional codebase. The logic flow (buy parent → wait for fill → place child stops/targets) is indeed a common pattern. But keep in mind that real institutional solutions often have many additional layers (error handling, partial fills, reconnection logic, risk checks, etc.).
+
+4. Your Example Explained
+High-Level Flow
+Connect to TWS/IB Gateway, start the reader thread (app.run() in a threading.Thread).
+Wait for nextValidId.
+Place the parent market order immediately (with transmit=True).
+Wait until orderStatus reports the parent is FILLED (in the orderStatus callback).
+Once filled, store the fill price in self.parent_fill_price.
+Place the child bracket orders (stop + limit) in an OCA group so that one cancels the other.
+Exit the script after placing child orders.
+This is precisely how you do a “dynamic bracket.” You do not need multiple threads for each step; the single IB “API thread” will handle the callback events.
+
+5. Handling Partial Fills or Cancels
+Your sample only demonstrates a full fill scenario (i.e., once FILLED, place children). In real markets:
+
+You might get a partial fill and then remain partially unfilled for some time.
+If you wanted the bracket children to only cover the already filled quantity, you’d place partial child orders as partial fills occur. Alternatively, you can wait until the entire parent order is 100% filled to place the children.
+A more institutional approach might handle the partial fills in real time and scale out the bracket accordingly.
+6. Summary & Best Practices
+Thread Count:
+
+One “API thread” running app.run() is standard.
+Your main script can place orders, handle user input, etc.
+If you need concurrency for other tasks (e.g., data analysis), you can add threads, but do not spawn a new thread for each bracket order.
+Dynamic Orders:
+
+The code example is a valid approach if you want to wait for a market fill price, then place the bracket.
+Just be aware of the short risk window between the parent fill and child orders being accepted.
+Institutional Complexity:
+
+Larger scale solutions often have more robust partial-fill logic, multi-threaded or microservice architecture, integrated risk management, etc.
+But the core bracket order logic (OCA group, parent/child orders) is basically the same.
+Testing:
+
+Always test in a paper account or simulation environment (TWS paper trading) to ensure the sequence of events (especially partial fills) behaves as expected.
+Final Thoughts
+Your code is a solid starting point and illustrates exactly how to do a single-click bracket with a dynamic fill-based approach in Python. It’s absolutely viable for smaller scale or personal trading. Institutional desks may use more sophisticated setups and handle partial fills, error states, reconnections, etc. more thoroughly—but the core bracket/OCA concept remains the same.
+
+You do not need separate threads for the parent and child orders. One dedicated thread to run the IB event loop, plus your main thread to control order logic, is typically sufficient.
